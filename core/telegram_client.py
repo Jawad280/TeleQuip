@@ -12,7 +12,7 @@ class TelegramClient:
         return await self.bot.send_message(chat_id=chat_id, text=text, **kwargs)
 
     async def send_poll(self, chat_id, question, options):
-        return await self.bot.send_poll(chat_id, question, options)
+        return await self.bot.send_poll(chat_id, question, options, is_anonymous=False)
     
     async def send_gif_to_person(self, chat_id, gif_path, caption=None, ttl=None, **kwargs):
         """Send a GIF to a user in private chat with optional self-delete after ttl seconds."""
