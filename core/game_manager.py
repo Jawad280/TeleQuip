@@ -84,6 +84,10 @@ class GameManager:
         prompts = prompt_manager.get_random_prompts(total_prompts)
 
         players_list = list(game.players.values())
+
+        # Assign prompts so that each prompt is shared between two players.
+        # We keep the original per-player structure but ensure versus pairs
+        # are built later based on shared prompt text rather than list index.
         for i, player in enumerate(players_list):
             assigned_prompts = [prompts[(i + j) % len(prompts)] for j in range(m)]
             game.assigned_prompts[player.user_id] = assigned_prompts
@@ -107,29 +111,42 @@ class GameManager:
     # Pairing & polling
     # -------------------------
     def build_versus_pairs(self, game: Game):
-        """Build unique player pairs for each prompt."""
-        players = list(game.players.values())
+        """
+        Build versus pairs by matching players that received the *same* prompt.
+
+        We look at all assigned prompts and, for each distinct prompt text,
+        pair up players who were given that prompt (regardless of the index
+        it appears at in their personal list).
+        """
+        prompt_map = {}  # prompt_text -> list[(user_id, prompt_idx)]
+
+        for user_id, prompts in game.assigned_prompts.items():
+            for idx, prompt_text in enumerate(prompts):
+                if not prompt_text:
+                    continue
+                prompt_map.setdefault(prompt_text, []).append((user_id, idx))
+
         pairs = []
-        if not players:
-            return pairs
+        for prompt_text, entries in prompt_map.items():
+            if len(entries) < 2:
+                continue
 
-        m = len(game.pending_answers[players[0].user_id])  # prompts per player
-        n = len(players)
+            # deterministic ordering
+            entries.sort(key=lambda x: x[0])
 
-        for prompt_idx in range(m):
-            for i in range(0, n, 2):
-                p1 = players[i]
-                p2 = players[(i + 1) % n]  # wrap-around if odd count
-                pairs.append((prompt_idx, p1.user_id, p2.user_id))
+            # Pair sequentially: (0,1), (2,3), ...
+            for i in range(0, len(entries) - 1, 2):
+                (p1_id, idx1) = entries[i]
+                (p2_id, idx2) = entries[i + 1]
+                pairs.append((prompt_text, p1_id, idx1, p2_id, idx2))
 
         game.versus_pairs = pairs
 
     async def conduct_versus_poll(self, game: Game, telegram_client: TelegramClient, group_id):
         """(Unused separately) Create polls for versus pairs."""
-        for prompt_idx, p1_id, p2_id in game.versus_pairs:
-            prompt_text = game.assigned_prompts[p1_id][prompt_idx]
-            p1_answer = game.pending_answers[p1_id][prompt_idx]
-            p2_answer = game.pending_answers[p2_id][prompt_idx]
+        for prompt_text, p1_id, idx1, p2_id, idx2 in game.versus_pairs:
+            p1_answer = game.pending_answers[p1_id][idx1]
+            p2_answer = game.pending_answers[p2_id][idx2]
 
             question = f"{prompt_text}\n\nVote for the better answer:"
             options = [
@@ -142,7 +159,7 @@ class GameManager:
             # Track poll by poll_id (not message_id)
             poll_id = poll_message.poll.id
             game.votes[poll_id] = {}
-            game.poll_map[poll_id] = (prompt_idx, p1_id, p2_id)
+            game.poll_map[poll_id] = (p1_id, p2_id)
 
     # -------------------------
     # Scoring
@@ -152,7 +169,7 @@ class GameManager:
         if poll_id not in game.poll_map:
             return
 
-        prompt_idx, p1_id, p2_id = game.poll_map[poll_id]
+        p1_id, p2_id = game.poll_map[poll_id]
         votes = game.votes.get(poll_id, {})
         print(f"Votes for poll {poll_id}:", votes)
         total_votes = len(votes)
@@ -191,10 +208,9 @@ class GameManager:
         group_id = game.group_id
         self.build_versus_pairs(game)
 
-        for prompt_idx, p1_id, p2_id in game.versus_pairs:
-            prompt_text = game.assigned_prompts[p1_id][prompt_idx]
-            p1_answer = game.pending_answers[p1_id][prompt_idx]
-            p2_answer = game.pending_answers[p2_id][prompt_idx]
+        for prompt_text, p1_id, idx1, p2_id, idx2 in game.versus_pairs:
+            p1_answer = game.pending_answers[p1_id][idx1]
+            p2_answer = game.pending_answers[p2_id][idx2]
 
             question = f"{prompt_text}\n\nVote for the better answer!"
             options = [
@@ -206,7 +222,7 @@ class GameManager:
 
             poll_id = poll_message.poll.id
             game.votes[poll_id] = {}
-            game.poll_map[poll_id] = (prompt_idx, p1_id, p2_id)
+            game.poll_map[poll_id] = (p1_id, p2_id)
 
             start_time = asyncio.get_event_loop().time()
             while len(game.votes[poll_id]) < len(game.players):
