@@ -1,5 +1,5 @@
-import math
 import asyncio
+import random
 from config import RESPONSE_TIMEOUT, POLL_TIMING, LAST_REMINDER_TIME
 from models.Game import Game
 from core.telegram_client import TelegramClient
@@ -32,27 +32,27 @@ class GameManager:
     # -------------------------
     async def _round_timer(self, game: Game, telegram_client: TelegramClient):
         """Manages timer and sends time warnings during the round."""
-        half_time = RESPONSE_TIMEOUT // 2
-        last_reminder_time = RESPONSE_TIMEOUT - LAST_REMINDER_TIME
+        half_elapsed = RESPONSE_TIMEOUT / 2
+        warning_elapsed = max(0, RESPONSE_TIMEOUT - LAST_REMINDER_TIME)
 
         # Half-time warning
-        await asyncio.sleep(half_time)
+        await asyncio.sleep(half_elapsed)
         for player in game.players.values():
             await telegram_client.send_message_to_person(
                 player.user_id,
-                f"⏱ Half the time has passed! {RESPONSE_TIMEOUT - half_time} seconds left to submit your answers."
+                f"⏱ Half the time has passed! {int(RESPONSE_TIMEOUT - half_elapsed)} seconds left to submit your answers."
             )
 
         # 10-second warning
-        await asyncio.sleep(last_reminder_time - half_time)
+        await asyncio.sleep(max(0, warning_elapsed - half_elapsed))
         for player in game.players.values():
             await telegram_client.send_message_to_person(
                 player.user_id,
-                f"⚠️ Only {last_reminder_time} seconds left! Quickly finish your prompts!"
+                f"⚠️ Only {int(RESPONSE_TIMEOUT - warning_elapsed)} seconds left! Quickly finish your prompts!"
             )
 
         # Wait for the last few seconds
-        await asyncio.sleep(10)
+        await asyncio.sleep(max(0, RESPONSE_TIMEOUT - warning_elapsed))
 
         # Mark unanswered prompts
         for user_id, answers in game.pending_answers.items():
@@ -63,44 +63,93 @@ class GameManager:
         # Move to versus phase
         await self.start_versus_phase(game, telegram_client)
 
+    def _build_prompt_edges(self, user_ids, m):
+        """
+        Build a set of head-to-head matchups (edges).
+
+        Each edge corresponds to exactly one prompt, and that prompt is answered by
+        exactly two players (the endpoints of the edge). This guarantees there are
+        no "extra" prompts that won't be used during versus.
+        """
+        n = len(user_ids)
+        if n < 2 or m <= 0:
+            return [], 0
+
+        # Special-case: only one opponent exists; allow repeated matchups.
+        if n == 2:
+            return [(user_ids[0], user_ids[1])] * m, m
+
+        effective_m = min(m, n - 1)
+        if (n * effective_m) % 2 == 1:
+            effective_m -= 1
+        if effective_m <= 0:
+            return [], 0
+
+        edges = set()
+
+        # Circulant graph construction:
+        # connect each i to i+k for k=1..floor(effective_m/2).
+        for k in range(1, (effective_m // 2) + 1):
+            for i in range(n):
+                a = user_ids[i]
+                b = user_ids[(i + k) % n]
+                if a == b:
+                    continue
+                edges.add((a, b) if a < b else (b, a))
+
+        # If degree is odd, add the "opposite" perfect matching (requires even n).
+        if effective_m % 2 == 1 and n % 2 == 0:
+            k = n // 2
+            for i in range(n // 2):
+                a = user_ids[i]
+                b = user_ids[i + k]
+                edges.add((a, b) if a < b else (b, a))
+
+        edges_list = list(edges)
+        random.shuffle(edges_list)
+        return edges_list, effective_m
+
     async def start_round(
         self, game: Game, telegram_client: TelegramClient, prompt_manager: PromptManager, m=2
     ):
         """Start a new round and send prompts to all players."""
-        n = len(game.players)
         game.init_scores()
         game.round += 1
-        game.pending_answers = {uid: [None] * m for uid in game.players}
         game.prompt_messages = {uid: {} for uid in game.players}
-        game.assigned_prompts = {uid: [] for uid in game.players}  # user_id -> list[str]
+        game.assigned_prompts = {uid: [] for uid in game.players}  # user_id -> list[(prompt_id, prompt_text)]
 
         # Initialize poll tracking
         game.votes = {}
         game.poll_map = {}
         game.completed_polls = set()
 
-        # Pick enough prompts for this round
-        total_prompts = math.ceil(n / 2) * m
-        prompts = prompt_manager.get_random_prompts(total_prompts)
+        user_ids = list(game.players.keys())
+        random.shuffle(user_ids)
 
-        players_list = list(game.players.values())
+        edges, effective_m = self._build_prompt_edges(user_ids, m)
+        game.pending_answers = {uid: [None] * effective_m for uid in game.players}
 
-        # Assign prompts so that each prompt is shared between two players.
-        # We keep the original per-player structure but ensure versus pairs
-        # are built later based on shared prompt text rather than list index.
-        for i, player in enumerate(players_list):
-            assigned_prompts = [prompts[(i + j) % len(prompts)] for j in range(m)]
-            game.assigned_prompts[player.user_id] = assigned_prompts
+        # Each edge gets a prompt; both players on the edge receive it.
+        prompt_texts = prompt_manager.get_random_prompts(len(edges))
+        if not prompt_texts:
+            prompt_texts = ["⚠️ No prompts available (check data/prompts.txt)."]
 
+        for edge_idx, (u, v) in enumerate(edges):
+            prompt_id = f"r{game.round}_e{edge_idx}"
+            prompt_text = prompt_texts[edge_idx % len(prompt_texts)]
+            game.assigned_prompts[u].append((prompt_id, prompt_text))
+            game.assigned_prompts[v].append((prompt_id, prompt_text))
+
+        for player in game.players.values():
             # Send prompts individually
             await telegram_client.send_message_to_person(
                 player.user_id,
                 f"🎬 Round {game.round} has begun! You have {RESPONSE_TIMEOUT} seconds to respond to all prompts."
             )
-            for idx, prompt in enumerate(assigned_prompts):
+            for idx, (_, prompt_text) in enumerate(game.assigned_prompts.get(player.user_id, [])):
                 message = await telegram_client.send_message_to_person(
                     player.user_id,
-                    f"Prompt {idx+1}:\n\n{prompt}\n\nPlease reply to this message with your answer."
+                    f"Prompt {idx+1}:\n\n{prompt_text}\n\nPlease reply to this message with your answer."
                 )
                 game.prompt_messages[player.user_id][message.message_id] = idx
 
@@ -112,22 +161,24 @@ class GameManager:
     # -------------------------
     def build_versus_pairs(self, game: Game):
         """
-        Build versus pairs by matching players that received the *same* prompt.
+        Build versus pairs by matching players that received the same prompt instance.
 
-        We look at all assigned prompts and, for each distinct prompt text,
-        pair up players who were given that prompt (regardless of the index
-        it appears at in their personal list).
+        Prompts can be reused across edges (e.g., if the prompt pool is small), so we
+        match using a per-round prompt_id rather than just prompt text.
         """
-        prompt_map = {}  # prompt_text -> list[(user_id, prompt_idx)]
+        prompt_map = {}  # prompt_id -> {"text": prompt_text, "entries": list[(user_id, prompt_idx)]}
 
         for user_id, prompts in game.assigned_prompts.items():
-            for idx, prompt_text in enumerate(prompts):
-                if not prompt_text:
+            for idx, prompt_item in enumerate(prompts):
+                prompt_id, prompt_text = prompt_item
+                if not prompt_id:
                     continue
-                prompt_map.setdefault(prompt_text, []).append((user_id, idx))
+                prompt_map.setdefault(prompt_id, {"text": prompt_text, "entries": []})["entries"].append((user_id, idx))
 
         pairs = []
-        for prompt_text, entries in prompt_map.items():
+        for prompt in prompt_map.values():
+            prompt_text = prompt["text"]
+            entries = prompt["entries"]
             if len(entries) < 2:
                 continue
 
